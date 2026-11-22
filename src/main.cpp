@@ -1,5 +1,12 @@
 #include "audio_features.hpp"
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #include <onnxruntime_cxx_api.h>
 
 #include <algorithm>
@@ -21,6 +28,7 @@ using namespace music2emo;
 constexpr int tags_count = 56;
 constexpr int embedding_size = 1536;
 constexpr int window_samples = 30 * input_rate;
+constexpr int low_memory_chunk_samples = 6 * input_rate;
 constexpr int maximum_samples = 900 * input_rate;
 
 struct Metadata {
@@ -66,10 +74,31 @@ std::vector<float> read_pcm(const fs::path& path) {
     return audio;
 }
 
-Ort::SessionOptions create_options() {
+bool low_memory_required() {
+#ifdef _WIN32
+    constexpr auto threshold = 3ULL * 1024 * 1024 * 1024;
+    MEMORYSTATUSEX memory{};
+    memory.dwLength = sizeof(memory);
+    if (GlobalMemoryStatusEx(&memory) && (memory.ullAvailPhys < threshold || memory.ullAvailPageFile < threshold))
+        return true;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION job{};
+    if (QueryInformationJobObject(nullptr, JobObjectExtendedLimitInformation, &job, sizeof(job), nullptr)) {
+        const auto flags = job.BasicLimitInformation.LimitFlags;
+        if ((flags & JOB_OBJECT_LIMIT_JOB_MEMORY) && job.JobMemoryLimit < threshold) return true;
+        if ((flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY) && job.ProcessMemoryLimit < threshold) return true;
+    }
+#endif
+    return false;
+}
+
+Ort::SessionOptions create_options(bool low_memory) {
     Ort::SessionOptions options;
     options.SetIntraOpNumThreads(static_cast<int>(std::clamp(std::thread::hardware_concurrency() / 2, 1u, 4u)));
     options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+    if (low_memory) {
+        options.DisableCpuMemArena();
+        options.DisableMemPattern();
+    }
     return options;
 }
 
@@ -80,8 +109,8 @@ Ort::Value tensor(const Ort::MemoryInfo& memory, T* input, std::size_t count, co
 
 class Pipeline {
 public:
-    explicit Pipeline(const fs::path& root)
-        : metadata_(load_metadata(root)), options_(create_options()),
+    Pipeline(const fs::path& root, bool low_memory)
+        : metadata_(load_metadata(root)), low_memory_(low_memory), options_(create_options(low_memory_)),
           mert_(environment_, (root / "mert.onnx").c_str(), options_),
           btc_(environment_, (root / "btc.onnx").c_str(), options_),
           head_(environment_, (root / "emotion.onnx").c_str(), options_) {}
@@ -89,7 +118,8 @@ public:
     void infer(const std::vector<float>& audio, std::ostream& output, const fs::path& progress_path) {
         const int total = (static_cast<int>(audio.size()) + window_samples - 1) / window_samples;
         report_progress(progress_path, 0, total);
-        output << "{\"model\":\"Music2Emo\",\"window_ms\":30000,\"segments\":[";
+        output << "{\"model\":\"Music2Emo\",\"window_ms\":30000,\"low_memory\":"
+               << (low_memory_ ? "true" : "false") << ",\"segments\":[";
         for (int start = 0; start < static_cast<int>(audio.size()); start += window_samples) {
             const int length = std::min(window_samples, static_cast<int>(audio.size()) - start);
             write_window(audio.data() + start, start, length, output);
@@ -102,6 +132,7 @@ private:
     Metadata metadata_;
     ConstantQ constant_q_;
     Ort::Env environment_{ORT_LOGGING_LEVEL_WARNING, "Music2Emo"};
+    bool low_memory_;
     Ort::SessionOptions options_;
     Ort::Session mert_, btc_, head_;
     Ort::MemoryInfo memory_ = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
@@ -112,16 +143,31 @@ private:
         progress << complete << ' ' << total << '\n';
     }
 
-    void write_window(const float* audio, int start, int length, std::ostream& output) {
-        auto waveform = normalize_waveform(audio, length, input_rate * 2);
-        const std::array<std::int64_t, 2> wave_shape{1, static_cast<std::int64_t>(waveform.size())};
-        auto waveform_tensor = tensor(memory_, waveform.data(), waveform.size(), wave_shape);
+    std::array<float, embedding_size> acoustic_embedding(const float* audio, int length) {
+        std::array<float, embedding_size> embedding{};
         constexpr std::array mert_input{"waveform"};
         constexpr std::array mert_output{"embedding"};
-        auto extracted = mert_.Run(Ort::RunOptions{nullptr}, mert_input.data(), &waveform_tensor, 1, mert_output.data(), 1);
-        if (extracted[0].GetTensorTypeAndShapeInfo().GetElementCount() != embedding_size) throw std::runtime_error("Incorrect MERT output");
-        float* embedding = extracted[0].GetTensorMutableData<float>();
+        const int chunk_size = low_memory_ ? low_memory_chunk_samples : length;
+        // The MERT graph pools each chunk in time. Weight those embeddings by
+        // their actual audio lengths so a short final chunk stays proportional.
+        for (int offset = 0; offset < length; offset += chunk_size) {
+            const int count = std::min(chunk_size, length - offset);
+            auto waveform = normalize_waveform(audio + offset, count, input_rate * 2);
+            const std::array<std::int64_t, 2> shape{1, static_cast<std::int64_t>(waveform.size())};
+            auto input = tensor(memory_, waveform.data(), waveform.size(), shape);
+            auto extracted = mert_.Run(Ort::RunOptions{nullptr}, mert_input.data(), &input, 1, mert_output.data(), 1);
+            if (extracted[0].GetTensorTypeAndShapeInfo().GetElementCount() != embedding_size)
+                throw std::runtime_error("Incorrect MERT output");
+            const auto* values = extracted[0].GetTensorData<float>();
+            const float weight = static_cast<float>(count) / static_cast<float>(length);
+            for (std::size_t index = 0; index < embedding.size(); ++index)
+                embedding[index] += values[index] * weight;
+        }
+        return embedding;
+    }
 
+    void write_window(const float* audio, int start, int length, std::ostream& output) {
+        auto embedding = acoustic_embedding(audio, length);
         auto chords = resample_for_chords(audio, length);
         std::vector<int> classes;
         for (int offset = 0; offset < static_cast<int>(chords.size()); offset += 10 * chord_rate) {
@@ -144,7 +190,7 @@ private:
         auto harmony = encode_harmony(classes, metadata_.attributes);
         constexpr std::array<std::int64_t, 2> embedding_shape{1, embedding_size}, chord_shape{1, max_chords}, key_shape{1, 1};
         std::array inputs{
-            tensor(memory_, embedding, embedding_size, embedding_shape),
+            tensor(memory_, embedding.data(), embedding.size(), embedding_shape),
             tensor(memory_, harmony.roots.data(), harmony.roots.size(), chord_shape),
             tensor(memory_, harmony.attributes.data(), harmony.attributes.size(), chord_shape),
             tensor(memory_, &harmony.minor, 1, key_shape),
@@ -180,15 +226,31 @@ private:
 template<typename Char>
 int run(int argc, Char** argv) {
     try {
-        if (argc != 4 && argc != 5) throw std::runtime_error("Usage: revelation-music2emo audio.f32 results.json model_directory [progress.txt]");
+        const bool force_low_memory = argc == 6 && fs::path(argv[5]) == fs::path("--low-memory");
+        if (argc < 4 || argc > 6 || (argc == 6 && !force_low_memory))
+            throw std::runtime_error("Usage: revelation-music2emo audio.f32 results.json model_directory [progress.txt [--low-memory]]");
         const auto audio = read_pcm(argv[1]);
-        Pipeline pipeline(argv[3]);
-        std::ofstream output(fs::path(argv[2]), std::ios::binary);
-        output.exceptions(std::ios::badbit | std::ios::failbit);
-        output.imbue(std::locale::classic());
-        output << std::setprecision(7);
-        pipeline.infer(audio, output, argc == 5 ? fs::path(argv[4]) : fs::path{});
-        output.close();
+        const bool initial_low_memory = force_low_memory || low_memory_required();
+        const auto analyze = [&](bool low_memory) {
+            Pipeline pipeline(argv[3], low_memory);
+            std::ofstream output(fs::path(argv[2]), std::ios::binary);
+            output.exceptions(std::ios::badbit | std::ios::failbit);
+            output.imbue(std::locale::classic());
+            output << std::setprecision(7);
+            pipeline.infer(audio, output, argc >= 5 ? fs::path(argv[4]) : fs::path{});
+            output.close();
+        };
+        try {
+            analyze(initial_low_memory);
+        } catch (const Ort::Exception& error) {
+            const std::string message = error.what();
+            if (initial_low_memory || (message.find("allocat") == std::string::npos
+                && message.find("out of memory") == std::string::npos)) throw;
+            analyze(true);
+        } catch (const std::bad_alloc&) {
+            if (initial_low_memory) throw;
+            analyze(true);
+        }
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

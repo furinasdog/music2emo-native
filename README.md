@@ -37,6 +37,8 @@ The tested MERT repack is `mert/model.safetensors.zst` with SHA-256 `6f8e05b485d
 
 The neural graphs use the upstream learned weights. The port computes 144-bin constant-Q spectra with Hann windows at fixed tuning, estimates key from predicted chord durations, and applies the emotion model separately for each editing window. The reference Python application uses librosa tuning/resampling and reads the song's key via music21. These differences can change the scores, particularly around short sections and modulations. `export_models.py` checks PyTorch versus ONNX output for each exported graph; this checks graph conversion rather than end-to-end equivalence of the front ends.
 
+On Windows the analyzer switches to low-memory inference when available memory or a Windows Job commit limit is below 3 GiB. Each 30-second segment retains its original timing and harmony. The MERT encoder processes up to six seconds at a time and combines the embeddings by duration. Emotion scores can differ from full-window inference. Inference output records the chosen path in `low_memory`.
+
 ## Citation
 
 Jaeyong Kang and Dorien Herremans, [Towards Unified Music Emotion Recognition across Dimensional and Categorical Models](https://arxiv.org/abs/2502.03979).
