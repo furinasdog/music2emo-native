@@ -21,7 +21,7 @@ An optional fourth argument is a progress file. The process writes the number of
 
 ## Model files
 
-The runtime requires `mert.onnx`, `btc.onnx`, `emotion.onnx`, and `metadata.txt` in the same directory. Select the directory in the editor's 「情绪分析」 tab. The editor can also discover it from the `AUTOREVELATION_MUSIC2EMO_MODELS` environment variable.
+The runtime requires `mert.onnx`, `btc.onnx`, `emotion.onnx`, and `metadata.txt` in the same directory. In the editor, choose 「情绪分析 → 下载模型」 to install the [published ONNX bundle](https://github.com/furinasdog/music2emo-native/releases/tag/models-v1). To install manually, extract the bundle and select its directory in the editor. The editor can also discover the directory from the `AUTOREVELATION_MUSIC2EMO_MODELS` environment variable.
 
 Use the [Music2Emo repository](https://github.com/AMAAI-Lab/Music2Emotion/tree/c5f7984f78d9928b841f25bd05a47377c12c58ca) and the [MERT checkpoint](https://huggingface.co/m-a-p/MERT-v1-95M/tree/12af15fef9d0ac838c3f475bfbbf26d2060dd4f5) to prepare the assets:
 
